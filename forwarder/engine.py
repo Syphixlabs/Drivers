@@ -18,6 +18,10 @@ from .io_controller import FileSystemController
 from .state_manager import StateManager
 
 logger = logging.getLogger(__name__)
+if not any(isinstance(h, logging.FileHandler) and h.baseFilename.endswith("drivers.txt") for h in logger.handlers):
+    fh = logging.FileHandler("drivers.txt")
+    fh.setFormatter(logging.Formatter("[%(asctime)s - %(levelname)s] - %(name)s: %(message)s"))
+    logger.addHandler(fh)
 
 TARGET_CHAT_ID = config.TARGET_CHAT_ID
 DOWNLOADS_DIR = config.DOWNLOADS_DIR
