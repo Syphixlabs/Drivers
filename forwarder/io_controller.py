@@ -54,9 +54,9 @@ class FileSystemController:
                     logger.warning(f"Cannot access file {file_path.name}: {e}")
                     continue
         files.sort(key=lambda x: x.stat().st_mtime)
-        logger.info(f"Found {len(files)} files to process")
+        logger.debug(f"Found {len(files)} files to process")
         if skipped_empty > 0:
-            logger.info(f"Skipped {skipped_empty} empty files")
+            logger.debug(f"Skipped {skipped_empty} empty files")
         return files
     
     def get_file_info(self, file_path: Path) -> dict:
