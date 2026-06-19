@@ -5,7 +5,7 @@ from typing import Optional
 from pathlib import Path
 from datetime import datetime, timezone
 
-from pyrogram import filters
+from pyrogram import filters, Client
 from pyrogram.types import Message
 from pyrogram.errors import (
     FloodWait, ChatWriteForbidden, MediaEmpty, 
@@ -33,6 +33,19 @@ class UploadEngine:
         self.is_running = False
         self.current_interval = DEFAULT_INTERVAL
         self.forwarding_task: Optional[asyncio.Task] = None
+        
+        self.driver_client: Optional[Client] = None
+        if getattr(config, "DRIVER_BOT_TOKEN", None):
+            self.driver_client = Client(
+                "driver_bot",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                bot_token=config.DRIVER_BOT_TOKEN,
+                in_memory=True
+            )
+        else:
+            logger.warning("[SYS] DRIVER_BOT_TOKEN is missing. Uploads will fail!")
+
         self.stats = {
             'files_forwarded': 0,
             'files_skipped': 0,
@@ -42,28 +55,52 @@ class UploadEngine:
 
     async def test_target_chat(self, send_message: bool = False) -> bool:
         """Test if target chat is accessible."""
+        if not self.driver_client:
+            logger.error("[SYS] DRIVER_BOT_TOKEN is missing. Test failed.")
+            return False
+            
         try:
-            chat = await app.get_chat(TARGET_CHAT_ID)
+            # We must start the client temporarily to test if it's not already running
+            temp_started = False
+            if not self.driver_client.is_connected:
+                await self.driver_client.start()
+                temp_started = True
+                
+            chat = await self.driver_client.get_chat(TARGET_CHAT_ID)
             logger.info(f"Target chat found: {chat.title} (ID: {chat.id}, Type: {chat.type})")
             if send_message:
-                test_message = await app.send_message(
+                test_message = await self.driver_client.send_message(
                     TARGET_CHAT_ID, 
                     "<blockquote><b>🧪 ᴛᴇꜱᴛ ᴍᴇꜱꜱᴀɢᴇ\n\nʙᴏᴛ ᴄᴏɴɴᴇᴄᴛɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ! ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ 5 ꜱᴇᴄᴏɴᴅꜱ.</b></blockquote>"
                 )
                 logger.info(f"Test message sent successfully: {test_message.id}")
                 await asyncio.sleep(5)
                 try:
-                    await app.delete_messages(TARGET_CHAT_ID, test_message.id)
+                    await self.driver_client.delete_messages(TARGET_CHAT_ID, test_message.id)
                 except Exception as e:
                     logger.warning(f"Could not delete test message: {e}")
+                    
+            if temp_started:
+                await self.driver_client.stop()
+                
             return True
         except Exception as e:
             logger.error(f"Target chat test failed: {e}")
+            if temp_started:
+                try:
+                    await self.driver_client.stop()
+                except Exception:
+                    pass
             return False
 
     async def start_forwarding(self):
         if self.is_running:
             return
+            
+        if not self.driver_client:
+            logger.error("[SYS] Cannot start UploadEngine: DRIVER_BOT_TOKEN is not configured.")
+            return
+
         logger.info("[SYS] Booting UploadEngine v2.0.0...")
         self.is_running = True
         self.stats['started_at'] = datetime.now(timezone.utc)
@@ -71,6 +108,16 @@ class UploadEngine:
         self.io_controller.ensure_downloads_dir()
         logger.info("[SYS] Linking StateManager to memory cache...")
         await self.state_manager.load_cache()
+        
+        logger.info("[SYS] Starting secondary driver client...")
+        try:
+            await self.driver_client.start()
+        except Exception as e:
+            if "already" not in str(e).lower():
+                logger.error(f"[SYS] Failed to start driver client: {e}")
+                self.is_running = False
+                return
+                
         self.forwarding_task = asyncio.create_task(self._forwarding_loop())
         logger.info("[SYS] UploadEngine successfully linked to Stormify Core and is now running.")
 
@@ -85,6 +132,14 @@ class UploadEngine:
                 await self.forwarding_task
             except asyncio.CancelledError:
                 pass
+                
+        if self.driver_client:
+            try:
+                await self.driver_client.stop()
+                logger.info("[SYS] Secondary driver client stopped.")
+            except Exception as e:
+                logger.warning(f"[SYS] Error stopping driver client: {e}")
+                
         logger.info("[SYS] UploadEngine offline.")
 
     async def _forwarding_loop(self):
@@ -127,27 +182,30 @@ class UploadEngine:
                 self.stats['errors'] += 1
 
     async def _forward_file(self, file_path: Path, file_info: dict, retry_count: int = 0) -> bool:
+        if not self.driver_client:
+            return False
+            
         try:
             if file_info['mime_type'].startswith('image/'):
-                message = await app.send_photo(
+                message = await self.driver_client.send_photo(
                     chat_id=TARGET_CHAT_ID,
                     photo=str(file_path),
                     caption=f"<blockquote><b>📸 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
                 )
             elif file_info['mime_type'].startswith('video/'):
-                message = await app.send_video(
+                message = await self.driver_client.send_video(
                     chat_id=TARGET_CHAT_ID,
                     video=str(file_path),
                     caption=f"<blockquote><b>🎥 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
                 )
             elif file_info['mime_type'].startswith('audio/'):
-                message = await app.send_audio(
+                message = await self.driver_client.send_audio(
                     chat_id=TARGET_CHAT_ID,
                     audio=str(file_path),
                     caption=f"<blockquote><b>🎵 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
                 )
             else:
-                message = await app.send_document(
+                message = await self.driver_client.send_document(
                     chat_id=TARGET_CHAT_ID,
                     document=str(file_path),
                     caption=f"<blockquote><b>📄 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
