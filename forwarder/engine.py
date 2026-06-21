@@ -41,11 +41,10 @@ class UploadEngine:
         self.driver_client: Optional[Client] = None
         if getattr(config, "DRIVER_BOT_TOKEN", None):
             self.driver_client = Client(
-                "driver_bot",
+                "driver_bot_session",
                 api_id=config.API_ID,
                 api_hash=config.API_HASH,
                 bot_token=config.DRIVER_BOT_TOKEN,
-                in_memory=True
             )
         else:
             logger.warning("[SYS] DRIVER_BOT_TOKEN is missing. Uploads will fail!")
@@ -241,7 +240,14 @@ class UploadEngine:
                     await asyncio.sleep(5 * (retry_count + 1))
                     return await self._forward_file(file_path, file_info, retry_count + 1)
                 return False
-        except Exception:
+        except Exception as e:
+            if "TimeoutError" in str(type(e).__name__) or "Timeout" in str(e):
+                logger.warning(f"[UploadEngine] Timeout detected for {file_path.name}. Restarting driver client...")
+                try:
+                    await self.driver_client.stop()
+                    await self.driver_client.start()
+                except Exception:
+                    pass
             if retry_count < MAX_RETRY_ATTEMPTS:
                 await asyncio.sleep(5 * (retry_count + 1))
                 return await self._forward_file(file_path, file_info, retry_count + 1)
