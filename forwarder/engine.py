@@ -74,7 +74,7 @@ class UploadEngine:
             if send_message:
                 test_message = await self.driver_client.send_message(
                     TARGET_CHAT_ID, 
-                    "<blockquote><b>🧪 ᴛᴇꜱᴛ ᴍᴇꜱꜱᴀɢᴇ\n\nʙᴏᴛ ᴄᴏɴɴᴇᴄᴛɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ! ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ 5 ꜱᴇᴄᴏɴᴅꜱ.</b></blockquote>"
+                    "<b> ᴛᴇꜱᴛ ᴍᴇꜱꜱᴀɢᴇ\n\nʙᴏᴛ ᴄᴏɴɴᴇᴄᴛɪᴏɴ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ! ᴛʜɪꜱ ᴍᴇꜱꜱᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ɪɴ 5 ꜱᴇᴄᴏɴᴅꜱ.</b>"
                 )
                 logger.info(f"Test message sent successfully: {test_message.id}")
                 await asyncio.sleep(5)
@@ -158,16 +158,16 @@ class UploadEngine:
                 await asyncio.sleep(min(self.current_interval, 60))
 
     async def _process_files(self):
-        files = self.io_controller.get_all_files()
+        files = await self.io_controller.get_all_files_async()
         for file_path in files:
             if not self.is_running:
                 break
             try:
+                # O(1) in-memory check without synchronous disk reads
                 if await self.state_manager.is_file_forwarded(str(file_path)):
                     continue
-                if not self.io_controller.is_file_accessible(file_path):
-                    continue
-                if not await self.io_controller.wait_for_file_stability(file_path, timeout=10):
+                # Non-blocking stability check (skips files being actively downloaded)
+                if not await self.io_controller.wait_for_file_stability(file_path, timeout=0):
                     continue
                 file_info = self.io_controller.get_file_info(file_path)
                 if file_info['size_mb'] > MAX_FILE_SIZE_MB:
@@ -179,10 +179,13 @@ class UploadEngine:
                     self.stats['files_forwarded'] += 1
                 else:
                     self.stats['errors'] += 1
+                # Small non-blocking pause between file uploads
                 await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Error processing file {file_path.name}: {e}")
                 self.stats['errors'] += 1
+            # Yield control to the asyncio event loop for PyTgCalls & Telegram bot responsiveness
+            await asyncio.sleep(0.05)
 
     async def _forward_file(self, file_path: Path, file_info: dict, retry_count: int = 0) -> bool:
         if not self.driver_client:
@@ -193,25 +196,25 @@ class UploadEngine:
                 message = await self.driver_client.send_photo(
                     chat_id=TARGET_CHAT_ID,
                     photo=str(file_path),
-                    caption=f"<blockquote><b>📸 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
+                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
                 )
             elif file_info['mime_type'].startswith('video/'):
                 message = await self.driver_client.send_video(
                     chat_id=TARGET_CHAT_ID,
                     video=str(file_path),
-                    caption=f"<blockquote><b>🎥 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
+                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
                 )
             elif file_info['mime_type'].startswith('audio/'):
                 message = await self.driver_client.send_audio(
                     chat_id=TARGET_CHAT_ID,
                     audio=str(file_path),
-                    caption=f"<blockquote><b>🎵 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
+                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
                 )
             else:
                 message = await self.driver_client.send_document(
                     chat_id=TARGET_CHAT_ID,
                     document=str(file_path),
-                    caption=f"<blockquote><b>📄 {file_info['name']}\n💾 ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b></blockquote>"
+                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
                 )
             await self.state_manager.mark_file_forwarded(str(file_path), message.id)
             return True
@@ -242,12 +245,7 @@ class UploadEngine:
                 return False
         except Exception as e:
             if "TimeoutError" in str(type(e).__name__) or "Timeout" in str(e):
-                logger.warning(f"[UploadEngine] Timeout detected for {file_path.name}. Restarting driver client...")
-                try:
-                    await self.driver_client.stop()
-                    await self.driver_client.start()
-                except Exception:
-                    pass
+                logger.warning(f"[UploadEngine] Timeout detected for {file_path.name}. Retrying in background...")
             if retry_count < MAX_RETRY_ATTEMPTS:
                 await asyncio.sleep(5 * (retry_count + 1))
                 return await self._forward_file(file_path, file_info, retry_count + 1)
@@ -259,8 +257,8 @@ engine = UploadEngine()
 @app.on_message(filters.command(["fw_start", "fw_help"]) & filters.private & app.sudoers)
 async def start_command(client, message: Message):
     await message.reply(
-        "<blockquote><b>🤖 ꜱᴛᴏʀᴍɪꜰʏ ꜱʏꜱᴛᴇᴍ ᴅʀɪᴠᴇʀ (ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ)\n\n"
-        "📁 ᴄᴏᴍᴍᴀɴᴅꜱ:\n"
+        "<b> ꜱᴛᴏʀᴍɪꜰʏ ꜱʏꜱᴛᴇᴍ ᴅʀɪᴠᴇʀ (ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ)\n\n"
+        " ᴄᴏᴍᴍᴀɴᴅꜱ:\n"
         "• /fw_status - ᴇɴɢɪɴᴇ ꜱᴛᴀᴛᴜꜱ\n"
         "• /fw_run - ɪɴɪᴛɪᴀʟɪᴢᴇ ᴇɴɢɪɴᴇ\n"
         "• /fw_stop - ᴛᴇʀᴍɪɴᴀᴛᴇ ᴇɴɢɪɴᴇ\n"
@@ -269,94 +267,94 @@ async def start_command(client, message: Message):
         "• /fw_files - ʟɪꜱᴛ ɪ/ᴏ qᴜᴇᴜᴇ\n"
         "• /fw_cleanup - ᴄʟᴇᴀʀ ꜱᴛᴀᴛᴇ ᴄᴀᴄʜᴇ\n"
         "• /fw_test - ᴛᴇꜱᴛ ᴛᴀʀɢᴇᴛ ᴘɪɴɢ\n\n"
-        f"📂 ɪ/ᴏ ᴘᴀᴛʜ: `{DOWNLOADS_DIR}`\n"
-        f"📤 ᴛᴀʀɢᴇᴛ: `[HIDDEN FOR SECURITY]`</b></blockquote>"
+        f" ɪ/ᴏ ᴘᴀᴛʜ: `{DOWNLOADS_DIR}`\n"
+        f" ᴛᴀʀɢᴇᴛ: `[HIDDEN FOR SECURITY]`</b>"
     )
 
 @app.on_message(filters.command("fw_status") & filters.private & app.sudoers)
 async def status_command(client, message: Message):
-    status = "🟢 ᴏɴʟɪɴᴇ" if engine.is_running else "🔴 ᴏꜰꜰʟɪɴᴇ"
+    status = " ᴏɴʟɪɴᴇ" if engine.is_running else " ᴏꜰꜰʟɪɴᴇ"
     uptime = ""
     if engine.stats['started_at']:
         uptime_seconds = (datetime.now(timezone.utc) - engine.stats['started_at']).total_seconds()
         hours, remainder = divmod(uptime_seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
-        uptime = f"\n⏰ ᴜᴘᴛɪᴍᴇ: {int(hours)}ʜ {int(minutes)}ᴍ {int(seconds)}ꜱ"
+        uptime = f"\n ᴜᴘᴛɪᴍᴇ: {int(hours)}ʜ {int(minutes)}ᴍ {int(seconds)}ꜱ"
     
     await message.reply(
-        f"<blockquote><b>📊 ᴇɴɢɪɴᴇ ᴛᴇʟᴇᴍᴇᴛʀʏ\n\n"
-        f"🔄 ꜱᴛᴀᴛᴜꜱ: {status}\n"
-        f"⏱️ ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ: {engine.current_interval}ꜱ\n"
-        f"📁 ɪ/ᴏ ᴘᴀᴛʜ: `{DOWNLOADS_DIR}`\n"
-        f"📤 ᴛᴀʀɢᴇᴛ ᴄʜᴀᴛ: `[HIDDEN]`"
-        f"{uptime}</b></blockquote>"
+        f"<b> ᴇɴɢɪɴᴇ ᴛᴇʟᴇᴍᴇᴛʀʏ\n\n"
+        f" ꜱᴛᴀᴛᴜꜱ: {status}\n"
+        f" ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ: {engine.current_interval}ꜱ\n"
+        f" ɪ/ᴏ ᴘᴀᴛʜ: `{DOWNLOADS_DIR}`\n"
+        f" ᴛᴀʀɢᴇᴛ ᴄʜᴀᴛ: `[HIDDEN]`"
+        f"{uptime}</b>"
     )
 
 @app.on_message(filters.command("fw_test") & filters.private & app.sudoers)
 async def test_command(client, message: Message):
-    await message.reply("<blockquote><b>🧪 ᴘɪɴɢɪɴɢ ᴛᴀʀɢᴇᴛ ᴄʜᴀᴛ...</b></blockquote>")
+    await message.reply("<b> ᴘɪɴɢɪɴɢ ᴛᴀʀɢᴇᴛ ᴄʜᴀᴛ...</b>")
     success = await engine.test_target_chat(send_message=True)
     if success:
-        await message.reply("<blockquote><b>✅ ᴘɪɴɢ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ! ᴇɴɢɪɴᴇ ᴄᴀɴ ᴡʀɪᴛᴇ ᴛᴏ ᴛᴀʀɢᴇᴛ.</b></blockquote>")
+        await message.reply("<b> ᴘɪɴɢ ꜱᴜᴄᴄᴇꜱꜱꜰᴜʟ! ᴇɴɢɪɴᴇ ᴄᴀɴ ᴡʀɪᴛᴇ ᴛᴏ ᴛᴀʀɢᴇᴛ.</b>")
     else:
-        await message.reply("<blockquote><b>❌ ᴘɪɴɢ ꜰᴀɪʟᴇᴅ! ᴄʜᴇᴄᴋ ꜱʏꜱᴛᴇᴍ ᴘᴇʀᴍɪꜱꜱɪᴏɴꜱ.</b></blockquote>")
+        await message.reply("<b> ᴘɪɴɢ ꜰᴀɪʟᴇᴅ! ᴄʜᴇᴄᴋ ꜱʏꜱᴛᴇᴍ ᴘᴇʀᴍɪꜱꜱɪᴏɴꜱ.</b>")
 
 @app.on_message(filters.command("fw_run") & filters.private & app.sudoers)
 async def run_command(client, message: Message):
     if engine.is_running:
-        return await message.reply("<blockquote><b>⚠️ ᴇɴɢɪɴᴇ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴏɴʟɪɴᴇ!</b></blockquote>")
-    await message.reply("<blockquote><b>🧪 ᴠᴇʀɪꜰʏɪɴɢ ᴛᴀʀɢᴇᴛ ᴀᴄᴄᴇꜱꜱ...</b></blockquote>")
+        return await message.reply("<b> ᴇɴɢɪɴᴇ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴏɴʟɪɴᴇ!</b>")
+    await message.reply("<b> ᴠᴇʀɪꜰʏɪɴɢ ᴛᴀʀɢᴇᴛ ᴀᴄᴄᴇꜱꜱ...</b>")
     if not await engine.test_target_chat(send_message=False):
-        return await message.reply("<blockquote><b>❌ ᴀᴄᴄᴇꜱꜱ ᴅᴇɴɪᴇᴅ. ᴄʜᴇᴄᴋ ᴘᴇʀᴍɪꜱꜱɪᴏɴꜱ.</b></blockquote>")
+        return await message.reply("<b> ᴀᴄᴄᴇꜱꜱ ᴅᴇɴɪᴇᴅ. ᴄʜᴇᴄᴋ ᴘᴇʀᴍɪꜱꜱɪᴏɴꜱ.</b>")
     await engine.start_forwarding()
-    await message.reply("<blockquote><b>✅ ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ɪɴɪᴛɪᴀʟɪᴢᴇᴅ ᴀɴᴅ ᴏɴʟɪɴᴇ!</b></blockquote>")
+    await message.reply("<b> ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ɪɴɪᴛɪᴀʟɪᴢᴇᴅ ᴀɴᴅ ᴏɴʟɪɴᴇ!</b>")
 
 @app.on_message(filters.command("fw_stop") & filters.private & app.sudoers)
 async def stop_command(client, message: Message):
     if not engine.is_running:
-        return await message.reply("<blockquote><b>⚠️ ᴇɴɢɪɴᴇ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴏꜰꜰʟɪɴᴇ!</b></blockquote>")
+        return await message.reply("<b> ᴇɴɢɪɴᴇ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴏꜰꜰʟɪɴᴇ!</b>")
     await engine.stop_forwarding()
-    await message.reply("<blockquote><b>🛑 ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ᴛᴇʀᴍɪɴᴀᴛᴇᴅ!</b></blockquote>")
+    await message.reply("<b> ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ᴛᴇʀᴍɪɴᴀᴛᴇᴅ!</b>")
 
 @app.on_message(filters.command("fw_interval") & filters.private & app.sudoers)
 async def interval_command(client, message: Message):
     try:
         new_interval = int(message.text.split()[1])
         if new_interval < 10:
-            return await message.reply("<blockquote><b>❌ ᴍɪɴɪᴍᴜᴍ ɪɴᴛᴇʀᴠᴀʟ ɪꜱ 10 ꜱᴇᴄᴏɴᴅꜱ</b></blockquote>")
+            return await message.reply("<b> ᴍɪɴɪᴍᴜᴍ ɪɴᴛᴇʀᴠᴀʟ ɪꜱ 10 ꜱᴇᴄᴏɴᴅꜱ</b>")
         engine.current_interval = new_interval
-        await message.reply(f"<blockquote><b>✅ ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ ᴜᴘᴅᴀᴛᴇᴅ ᴛᴏ {new_interval} ꜱᴇᴄᴏɴᴅꜱ</b></blockquote>")
+        await message.reply(f"<b> ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ ᴜᴘᴅᴀᴛᴇᴅ ᴛᴏ {new_interval} ꜱᴇᴄᴏɴᴅꜱ</b>")
     except (IndexError, ValueError):
-        await message.reply("<blockquote><b>❌ ᴜꜱᴀɢᴇ: `/fw_interval <ꜱᴇᴄᴏɴᴅꜱ>`</b></blockquote>")
+        await message.reply("<b> ᴜꜱᴀɢᴇ: `/fw_interval <ꜱᴇᴄᴏɴᴅꜱ>`</b>")
 
 @app.on_message(filters.command("fw_stats") & filters.private & app.sudoers)
 async def stats_command(client, message: Message):
     forwarded_count = await engine.state_manager.get_forwarded_files_count()
     await message.reply(
-        f"<blockquote><b>📈 ᴇɴɢɪɴᴇ ꜱᴛᴀᴛɪꜱᴛɪᴄꜱ\n\n"
-        f"📤 ᴘᴀᴄᴋᴇᴛꜱ ꜱᴇɴᴛ: {engine.stats['files_forwarded']}\n"
-        f"⏭️ ᴘᴀᴄᴋᴇᴛꜱ ꜱᴋɪᴘᴘᴇᴅ: {engine.stats['files_skipped']}\n"
-        f"❌ ɪ/ᴏ ᴇʀʀᴏʀꜱ: {engine.stats['errors']}\n"
-        f"💾 ꜱᴛᴀᴛᴇ ᴄᴀᴄʜᴇ ꜱɪᴢᴇ: {forwarded_count}</b></blockquote>"
+        f"<b> ᴇɴɢɪɴᴇ ꜱᴛᴀᴛɪꜱᴛɪᴄꜱ\n\n"
+        f" ᴘᴀᴄᴋᴇᴛꜱ ꜱᴇɴᴛ: {engine.stats['files_forwarded']}\n"
+        f" ᴘᴀᴄᴋᴇᴛꜱ ꜱᴋɪᴘᴘᴇᴅ: {engine.stats['files_skipped']}\n"
+        f" ɪ/ᴏ ᴇʀʀᴏʀꜱ: {engine.stats['errors']}\n"
+        f" ꜱᴛᴀᴛᴇ ᴄᴀᴄʜᴇ ꜱɪᴢᴇ: {forwarded_count}</b>"
     )
 
 @app.on_message(filters.command("fw_files") & filters.private & app.sudoers)
 async def files_command(client, message: Message):
-    files = engine.io_controller.get_all_files()
+    files = await engine.io_controller.get_all_files_async()
     pending = []
     for f in files[:10]:
         if not await engine.state_manager.is_file_forwarded(str(f)):
             info = engine.io_controller.get_file_info(f)
-            pending.append(f"📄 `{info['name']}` ({info['size_mb']} ᴍʙ)")
+            pending.append(f" `{info['name']}` ({info['size_mb']} ᴍʙ)")
     if pending:
         msg = "\n".join(pending)
         if len(files) > 10:
             msg += f"\n... ᴀɴᴅ {len(files)-len(pending)} ᴍᴏʀᴇ."
-        await message.reply(f"<blockquote><b>📋 ɪ/ᴏ qᴜᴇᴜᴇ:\n\n{msg}</b></blockquote>")
+        await message.reply(f"<b> ɪ/ᴏ qᴜᴇᴜᴇ:\n\n{msg}</b>")
     else:
-        await message.reply("<blockquote><b>✅ ɪ/ᴏ qᴜᴇᴜᴇ ɪꜱ ᴇᴍᴘᴛʏ!</b></blockquote>")
+        await message.reply("<b> ɪ/ᴏ qᴜᴇᴜᴇ ɪꜱ ᴇᴍᴘᴛʏ!</b>")
 
 @app.on_message(filters.command("fw_cleanup") & filters.private & app.sudoers)
 async def cleanup_command(client, message: Message):
     cleaned = await engine.state_manager.cleanup_old_entries(days=30)
-    await message.reply(f"<blockquote><b>🧹 ᴄʟᴇᴀʀᴇᴅ {cleaned} ꜱᴛᴀʟᴇ ᴄᴀᴄʜᴇ ᴇɴᴛʀɪᴇꜱ.</b></blockquote>")
+    await message.reply(f"<b> ᴄʟᴇᴀʀᴇᴅ {cleaned} ꜱᴛᴀʟᴇ ᴄᴀᴄʜᴇ ᴇɴᴛʀɪᴇꜱ.</b>")

@@ -2,9 +2,10 @@
 File management utilities
 """
 import os
+import time
 import asyncio
 import mimetypes
-from typing import List, Generator, Tuple
+from typing import List, Optional
 from pathlib import Path
 import logging
 
@@ -24,43 +25,64 @@ class FileSystemController:
             '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a',
             # Archives
             '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2',
-            # Others add if needed anytypes of files 
+            # Others
             '.apk', '.exe', '.dmg', '.iso', '.torrent'
         }
+        self.temporary_markers = {'.part', '.ytdl', '.temp', '.tmp', '.aria2', '.download'}
     
     def ensure_downloads_dir(self) -> None:
         """Create downloads directory if it doesn't exist"""
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Downloads directory: {self.downloads_dir}")
-    
-    def get_all_files(self) -> List[Path]:
-        """Get all supported files from downloads directory"""
+
+    def _sync_get_all_files(self) -> List[Path]:
+        """Scan directory synchronously inside a worker thread to prevent event loop lag."""
         if not self.downloads_dir.exists():
-            logger.warning(f"Downloads directory does not exist: {self.downloads_dir}")
             return []
-        files = []
-        skipped_empty = 0
-        for file_path in self.downloads_dir.rglob("*"):
-            if (file_path.is_file() and 
-                file_path.suffix.lower() in self.supported_extensions and
-                not file_path.name.startswith('.')):
-                try:
-                    file_size = file_path.stat().st_size
-                    if file_size == 0:
-                        skipped_empty += 1
-                        continue
-                    files.append(file_path)
-                except (OSError, IOError) as e:
-                    logger.warning(f"Cannot access file {file_path.name}: {e}")
+        
+        files_with_mtime = []
+        now = time.time()
+
+        try:
+            for file_path in self.downloads_dir.rglob("*"):
+                name = file_path.name
+                # Ignore hidden files, temporary download fragments, and active yt-dlp buffers
+                if name.startswith('.'):
                     continue
-        files.sort(key=lambda x: x.stat().st_mtime)
-        logger.debug(f"Found {len(files)} files to process")
-        if skipped_empty > 0:
-            logger.debug(f"Skipped {skipped_empty} empty files")
-        return files
-    
+                if any(marker in name.lower() for marker in self.temporary_markers):
+                    continue
+                if file_path.suffix.lower() not in self.supported_extensions:
+                    continue
+
+                try:
+                    if not file_path.is_file():
+                        continue
+                    stat = file_path.stat()
+                    if stat.st_size == 0:
+                        continue
+                    # Skip files actively written within the last 3 seconds (active downloads/streams)
+                    if (now - stat.st_mtime) < 3.0:
+                        continue
+                    files_with_mtime.append((stat.st_mtime, file_path))
+                except (OSError, IOError):
+                    continue
+        except Exception as e:
+            logger.warning(f"Error scanning downloads directory: {e}")
+            return []
+
+        files_with_mtime.sort(key=lambda x: x[0])
+        return [f for _, f in files_with_mtime]
+
+    async def get_all_files_async(self) -> List[Path]:
+        """Asynchronously get all supported files without blocking the main event loop."""
+        return await asyncio.to_thread(self._sync_get_all_files)
+
+    def get_all_files(self) -> List[Path]:
+        """Synchronous file scanner (falls back to _sync_get_all_files)."""
+        return self._sync_get_all_files()
+
     def get_file_info(self, file_path: Path) -> dict:
-        """Get file information"""
+        """Get file information safely."""
         try:
             stat = file_path.stat()
             mime_type, _ = mimetypes.guess_type(str(file_path))
@@ -85,9 +107,9 @@ class FileSystemController:
                 'mime_type': 'application/octet-stream',
                 'extension': file_path.suffix.lower()
             }
-    
+
     def is_file_accessible(self, file_path: Path) -> bool:
-        """Check if file is accessible and not being written to"""
+        """Check if file is accessible and can be read."""
         try:
             if not file_path.exists() or not os.access(file_path, os.R_OK):
                 return False
@@ -98,29 +120,27 @@ class FileSystemController:
             return True
         except (OSError, IOError, PermissionError):
             return False
-    
-    async def wait_for_file_stability(self, file_path: Path, timeout: int = 30) -> bool:
-        """Wait for file to be stable (not being written to)"""
+
+    async def is_file_accessible_async(self, file_path: Path) -> bool:
+        """Non-blocking accessibility check."""
+        return await asyncio.to_thread(self.is_file_accessible, file_path)
+
+    async def wait_for_file_stability(self, file_path: Path, timeout: int = 10) -> bool:
+        """
+        Instant, non-blocking stability check.
+        Verifies that file is not actively being written to without freezing the worker loop.
+        """
         try:
-            initial_size = file_path.stat().st_size
-            if initial_size == 0:
+            stat = file_path.stat()
+            if stat.st_size == 0:
                 return False
-            for _ in range(timeout):
-                await asyncio.sleep(1)
-                try:
-                    current_size = file_path.stat().st_size
-                    if current_size == 0:
-                        logger.warning(f"File became empty during stability check: {file_path.name}")
-                        return False
-                    if current_size == initial_size and self.is_file_accessible(file_path):
-                        return True
-                    initial_size = current_size
-                except OSError:
-                    continue
-            return self.is_file_accessible(file_path)
+            # If modified within the last 3 seconds, a process is still writing to it
+            if (time.time() - stat.st_mtime) < 3.0:
+                return False
+            return await self.is_file_accessible_async(file_path)
         except OSError:
             return False
-    
+
     def get_file_stats(self) -> dict:
         """Get statistics about files in downloads directory"""
         if not self.downloads_dir.exists():
@@ -152,7 +172,7 @@ class FileSystemController:
             'valid_files': valid_files,
             'total_size_mb': round(total_size / (1024 * 1024), 2)
         }
-    
+
     def cleanup_empty_files(self, delete: bool = False) -> int:
         """Find and optionally delete empty files"""
         empty_files = []
@@ -163,7 +183,6 @@ class FileSystemController:
                 if (file_path.is_file() and 
                     file_path.suffix.lower() in self.supported_extensions and
                     not file_path.name.startswith('.')):
-                    
                     try:
                         if file_path.stat().st_size == 0:
                             empty_files.append(file_path)
@@ -173,7 +192,6 @@ class FileSystemController:
                     except OSError as e:
                         logger.warning(f"Cannot process file {file_path.name}: {e}")
                         continue
-        
         except Exception as e:
             logger.error(f"Error during empty files cleanup: {e}")
         if not delete and empty_files:
