@@ -3,7 +3,8 @@ import asyncio
 import logging
 from typing import Optional
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
 
 from pyrogram import filters, Client
 from pyrogram.types import Message
@@ -37,6 +38,8 @@ class UploadEngine:
         self.is_running = False
         self.current_interval = DEFAULT_INTERVAL
         self.forwarding_task: Optional[asyncio.Task] = None
+        self.schedule_enabled = True
+        self.manual_override = False
         
         self.driver_client: Optional[Client] = None
         if getattr(config, "DRIVER_BOT_TOKEN", None):
@@ -254,12 +257,52 @@ class UploadEngine:
 # Plugin instance
 engine = UploadEngine()
 
+async def driver_scheduler(engine: UploadEngine):
+    """
+    Automated Daily Driver Scheduler (3:00 AM IST - 5:00 AM IST).
+    Automatically runs the engine from 03:00 to 05:00 IST and stops it at 05:00 IST every day.
+    """
+    logger.info("[SYS] Automated Daily Driver Scheduler started. Active window: 03:00 AM - 05:00 AM IST daily.")
+    while True:
+        try:
+            if getattr(engine, "schedule_enabled", True):
+                now_ist = datetime.now(IST)
+                in_window = (3 <= now_ist.hour < 5)
+
+                if in_window:
+                    if not engine.is_running:
+                        logger.info(
+                            f"[SYS] Daily schedule triggered at {now_ist.strftime('%I:%M:%S %p')} IST (window: 3 AM - 5 AM IST). Starting UploadEngine..."
+                        )
+                        engine.manual_override = False
+                        await engine.start_forwarding()
+                else:
+                    if engine.is_running and not getattr(engine, "manual_override", False):
+                        logger.info(
+                            f"[SYS] Daily schedule window ended at {now_ist.strftime('%I:%M:%S %p')} IST. Stopping UploadEngine..."
+                        )
+                        await engine.stop_forwarding()
+
+            await asyncio.sleep(20)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[SYS] Driver scheduler error: {e}")
+            await asyncio.sleep(60)
+
+try:
+    loop = asyncio.get_running_loop()
+    loop.create_task(driver_scheduler(engine))
+except RuntimeError:
+    pass
+
 @app.on_message(filters.command(["fw_start", "fw_help"]) & filters.private & app.sudoers)
 async def start_command(client, message: Message):
     await message.reply(
         "<b> ꜱᴛᴏʀᴍɪꜰʏ ꜱʏꜱᴛᴇᴍ ᴅʀɪᴠᴇʀ (ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ)\n\n"
         " ᴄᴏᴍᴍᴀɴᴅꜱ:\n"
         "• /fw_status - ᴇɴɢɪɴᴇ ꜱᴛᴀᴛᴜꜱ\n"
+        "• /fw_schedule - ᴅᴀɪʟʏ 3-5 ᴀᴍ ɪꜱᴛ ꜱᴄʜᴇᴅᴜʟᴇ\n"
         "• /fw_run - ɪɴɪᴛɪᴀʟɪᴢᴇ ᴇɴɢɪɴᴇ\n"
         "• /fw_stop - ᴛᴇʀᴍɪɴᴀᴛᴇ ᴇɴɢɪɴᴇ\n"
         "• /fw_interval <ꜱᴇᴄᴏɴᴅꜱ> - ꜱᴇᴛ ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ\n"
@@ -281,9 +324,17 @@ async def status_command(client, message: Message):
         minutes, seconds = divmod(remainder, 60)
         uptime = f"\n ᴜᴘᴛɪᴍᴇ: {int(hours)}ʜ {int(minutes)}ᴍ {int(seconds)}ꜱ"
     
+    now_ist = datetime.now(IST)
+    in_window = (3 <= now_ist.hour < 5)
+    sched_str = " ᴇɴᴀʙʟᴇᴅ (03:00 - 05:00 ᴀᴍ ɪꜱᴛ)" if getattr(engine, "schedule_enabled", True) else " ᴅɪꜱᴀʙʟᴇᴅ"
+    win_str = " ɪɴ ᴡɪɴᴅᴏᴡ (ᴀᴄᴛɪᴠᴇ)" if in_window else " ᴏᴜᴛꜱɪᴅᴇ ᴡɪɴᴅᴏᴡ (ɪᴅʟᴇ)"
+    
     await message.reply(
         f"<b> ᴇɴɢɪɴᴇ ᴛᴇʟᴇᴍᴇᴛʀʏ\n\n"
         f" ꜱᴛᴀᴛᴜꜱ: {status}\n"
+        f" ꜱᴄʜᴇᴅᴜʟᴇ: {sched_str}\n"
+        f" ꜱᴄʜᴇᴅᴜʟᴇ ᴡɪɴᴅᴏᴡ: {win_str}\n"
+        f" ᴄᴜʀʀᴇɴᴛ ɪꜱᴛ ᴛɪᴍᴇ: {now_ist.strftime('%I:%M:%S %p')} ɪꜱᴛ\n"
         f" ɪ/ᴏ ɪɴᴛᴇʀᴠᴀʟ: {engine.current_interval}ꜱ\n"
         f" ɪ/ᴏ ᴘᴀᴛʜ: `{DOWNLOADS_DIR}`\n"
         f" ᴛᴀʀɢᴇᴛ ᴄʜᴀᴛ: `[HIDDEN]`"
@@ -306,15 +357,42 @@ async def run_command(client, message: Message):
     await message.reply("<b> ᴠᴇʀɪꜰʏɪɴɢ ᴛᴀʀɢᴇᴛ ᴀᴄᴄᴇꜱꜱ...</b>")
     if not await engine.test_target_chat(send_message=False):
         return await message.reply("<b> ᴀᴄᴄᴇꜱꜱ ᴅᴇɴɪᴇᴅ. ᴄʜᴇᴄᴋ ᴘᴇʀᴍɪꜱꜱɪᴏɴꜱ.</b>")
+    engine.manual_override = True
     await engine.start_forwarding()
-    await message.reply("<b> ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ɪɴɪᴛɪᴀʟɪᴢᴇᴅ ᴀɴᴅ ᴏɴʟɪɴᴇ!</b>")
+    await message.reply("<b> ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ɪɴɪᴛɪᴀʟɪᴢᴇᴅ ᴀɴᴅ ᴏɴʟɪɴᴇ (ᴍᴀɴᴜᴀʟ ᴏᴠᴇʀʀɪᴅᴇ)!</b>")
 
 @app.on_message(filters.command("fw_stop") & filters.private & app.sudoers)
 async def stop_command(client, message: Message):
     if not engine.is_running:
         return await message.reply("<b> ᴇɴɢɪɴᴇ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴏꜰꜰʟɪɴᴇ!</b>")
+    engine.manual_override = False
     await engine.stop_forwarding()
     await message.reply("<b> ᴜᴘʟᴏᴀᴅ ᴇɴɢɪɴᴇ ᴛᴇʀᴍɪɴᴀᴛᴇᴅ!</b>")
+
+@app.on_message(filters.command("fw_schedule") & filters.private & app.sudoers)
+async def schedule_command(client, message: Message):
+    now_ist = datetime.now(IST)
+    in_window = (3 <= now_ist.hour < 5)
+    args = message.text.split()
+    if len(args) > 1:
+        action = args[1].lower()
+        if action in ["on", "enable", "true"]:
+            engine.schedule_enabled = True
+            return await message.reply("<b> ᴅᴀɪʟʏ ꜱᴄʜᴇᴅᴜʟᴇ ᴇɴᴀʙʟᴇᴅ (03:00 ᴀᴍ - 05:00 ᴀᴍ ɪꜱᴛ)!</b>")
+        elif action in ["off", "disable", "false"]:
+            engine.schedule_enabled = False
+            return await message.reply("<b> ᴅᴀɪʟʏ ꜱᴄʜᴇᴅᴜʟᴇ ᴅɪꜱᴀʙʟᴇᴅ!</b>")
+
+    sched_status = " ᴇɴᴀʙʟᴇᴅ" if getattr(engine, "schedule_enabled", True) else " ᴅɪꜱᴀʙʟᴇᴅ"
+    window_status = " ɪɴ ᴡɪɴᴅᴏᴡ (ᴀᴄᴛɪᴠᴇ)" if in_window else " ᴏᴜᴛꜱɪᴅᴇ ᴡɪɴᴅᴏᴡ (ɪᴅʟᴇ)"
+    await message.reply(
+        f"<b> ᴅᴀɪʟʏ ᴅʀɪᴠᴇʀ ꜱᴄʜᴇᴅᴜʟᴇʀ\n\n"
+        f"• ꜱᴄʜᴇᴅᴜʟᴇ: `03:00 AM - 05:00 AM IST (Daily)`\n"
+        f"• ꜱᴛᴀᴛᴜꜱ: {sched_status}\n"
+        f"• ᴡɪɴᴅᴏᴡ: {window_status}\n"
+        f"• ᴄᴜʀʀᴇɴᴛ ɪꜱᴛ ᴛɪᴍᴇ: `{now_ist.strftime('%I:%M:%S %p')} IST`\n\n"
+        f" ᴛᴏ ᴛᴏɢɢʟᴇ: `/fw_schedule on` ᴏʀ `/fw_schedule off`</b>"
+    )
 
 @app.on_message(filters.command("fw_interval") & filters.private & app.sudoers)
 async def interval_command(client, message: Message):
