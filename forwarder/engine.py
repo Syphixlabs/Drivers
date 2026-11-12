@@ -205,30 +205,39 @@ class UploadEngine:
                 try:
                     import mutagen
                     audio_meta = mutagen.File(str(file_path))
-                    if audio_meta:
-                        title = ""
-                        artist = ""
-                        if hasattr(audio_meta, "tags") and audio_meta.tags:
-                            title = str(audio_meta.tags.get("TIT2") or audio_meta.tags.get("\xa9nam") or "")
-                            artist = str(audio_meta.tags.get("TPE1") or audio_meta.tags.get("\xa9ART") or "")
-                        if title:
-                            from stormify import yt
-                            clean_t = re.sub(r"\.(mp3|m4a|wav|flac|ogg|mp4|mkv)$", "", title, flags=re.IGNORECASE).strip()
-                            clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
-                            q = f"{clean_t} {artist}".strip()
-                            resolved = await yt.search(q, 0)
-                            if resolved and resolved.id and not resolved.id.startswith("vortex_") and not resolved.id.startswith("tg_"):
-                                yt_id = resolved.id
-                                new_path = file_path.with_name(f"{yt_id}{file_path.suffix}")
-                                if not new_path.exists():
-                                    file_path.rename(new_path)
-                                    file_path = new_path
-                                    file_info['name'] = new_path.name
+                    title = ""
+                    artist = ""
+                    if audio_meta and hasattr(audio_meta, "tags") and audio_meta.tags:
+                        if hasattr(audio_meta.tags, "getall"):
+                            tit2 = audio_meta.tags.get("TIT2")
+                            tpe1 = audio_meta.tags.get("TPE1")
+                            title = str(tit2.text[0]) if tit2 and getattr(tit2, "text", None) else str(tit2 or "")
+                            artist = str(tpe1.text[0]) if tpe1 and getattr(tpe1, "text", None) else str(tpe1 or "")
+                        else:
+                            raw_t = audio_meta.tags.get("TIT2") or audio_meta.tags.get("\xa9nam") or audio_meta.tags.get("title")
+                            raw_a = audio_meta.tags.get("TPE1") or audio_meta.tags.get("\xa9ART") or audio_meta.tags.get("artist")
+                            title = str(raw_t[0]) if isinstance(raw_t, list) and raw_t else str(raw_t or "")
+                            artist = str(raw_a[0]) if isinstance(raw_a, list) and raw_a else str(raw_a or "")
+
+                    if title:
+                        from stormify import yt
+                        clean_t = re.sub(r"\.(mp3|m4a|wav|flac|ogg|mp4|mkv)$", "", title, flags=re.IGNORECASE).strip()
+                        clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
+                        q = f"{clean_t} {artist}".strip()
+                        resolved = await yt.search(q, 0)
+                        if resolved and resolved.id and not resolved.id.startswith("vortex_") and not resolved.id.startswith("tg_"):
+                            yt_id = resolved.id
+                            new_path = file_path.with_name(f"{yt_id}{file_path.suffix}")
+                            if not new_path.exists():
+                                file_path.rename(new_path)
+                                file_path = new_path
+                                file_info['name'] = new_path.name
                 except Exception as e:
                     logger.debug(f"[UploadEngine] Error resolving YouTube ID for {file_path.name}: {e}")
 
             caption_header = f"<b>{yt_id}</b>\n\n" if yt_id else ""
-            caption = f"{caption_header}<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+            display_title = title if 'title' in locals() and title else file_info['name']
+            caption = f"{caption_header}<b> {display_title}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
             upload_fn = f"{yt_id}{file_path.suffix}" if yt_id else file_info['name']
 
             if file_info['mime_type'].startswith('image/'):
