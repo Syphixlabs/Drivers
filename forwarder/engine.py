@@ -195,29 +195,68 @@ class UploadEngine:
             return False
             
         try:
+            # Check if filename is an actual 11-char YouTube ID or needs resolution
+            stem = file_path.stem
+            is_yt_id = bool(re.match(r"^[0-9A-Za-z_-]{11}$", stem))
+            yt_id = stem if is_yt_id else None
+
+            # If file has tg_ prefix or non-YouTube name, resolve the actual YouTube ID
+            if not yt_id:
+                try:
+                    import mutagen
+                    audio_meta = mutagen.File(str(file_path))
+                    if audio_meta:
+                        title = ""
+                        artist = ""
+                        if hasattr(audio_meta, "tags") and audio_meta.tags:
+                            title = str(audio_meta.tags.get("TIT2") or audio_meta.tags.get("\xa9nam") or "")
+                            artist = str(audio_meta.tags.get("TPE1") or audio_meta.tags.get("\xa9ART") or "")
+                        if title:
+                            from stormify import yt
+                            clean_t = re.sub(r"\.(mp3|m4a|wav|flac|ogg|mp4|mkv)$", "", title, flags=re.IGNORECASE).strip()
+                            clean_t = re.sub(r"[\(\[\{].*?[\)\]\}]", "", clean_t).strip()
+                            q = f"{clean_t} {artist}".strip()
+                            resolved = await yt.search(q, 0)
+                            if resolved and resolved.id and not resolved.id.startswith("vortex_") and not resolved.id.startswith("tg_"):
+                                yt_id = resolved.id
+                                new_path = file_path.with_name(f"{yt_id}{file_path.suffix}")
+                                if not new_path.exists():
+                                    file_path.rename(new_path)
+                                    file_path = new_path
+                                    file_info['name'] = new_path.name
+                except Exception as e:
+                    logger.debug(f"[UploadEngine] Error resolving YouTube ID for {file_path.name}: {e}")
+
+            caption_header = f"<b>{yt_id}</b>\n\n" if yt_id else ""
+            caption = f"{caption_header}<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+            upload_fn = f"{yt_id}{file_path.suffix}" if yt_id else file_info['name']
+
             if file_info['mime_type'].startswith('image/'):
                 message = await self.driver_client.send_photo(
                     chat_id=TARGET_CHAT_ID,
                     photo=str(file_path),
-                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+                    caption=caption
                 )
             elif file_info['mime_type'].startswith('video/'):
                 message = await self.driver_client.send_video(
                     chat_id=TARGET_CHAT_ID,
                     video=str(file_path),
-                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+                    caption=caption,
+                    file_name=upload_fn
                 )
             elif file_info['mime_type'].startswith('audio/'):
                 message = await self.driver_client.send_audio(
                     chat_id=TARGET_CHAT_ID,
                     audio=str(file_path),
-                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+                    caption=caption,
+                    file_name=upload_fn
                 )
             else:
                 message = await self.driver_client.send_document(
                     chat_id=TARGET_CHAT_ID,
                     document=str(file_path),
-                    caption=f"<b> {file_info['name']}\n ꜱɪᴢᴇ: {file_info['size_mb']} ᴍʙ</b>"
+                    caption=caption,
+                    file_name=upload_fn
                 )
             await self.state_manager.mark_file_forwarded(str(file_path), message.id)
             return True
